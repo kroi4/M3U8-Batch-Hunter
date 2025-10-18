@@ -74,15 +74,25 @@
         </tr>
         <tr class="details-row" style="display:none">
           <td colspan="4">
-            <details open>
-              <summary>פרטים</summary>
-              <div class="details-text muted">—</div>
-              <div class="progress" style="margin-top:.4rem">
-                <div class="muted" style="font-size:.85rem"><span class="pct">0%</span> <span class="eta"></span></div>
-                <div style="height:8px;background:#eee;border-radius:6px;overflow:hidden">
-                  <div class="bar" style="height:8px;width:0%;background:#16a34a"></div>
-                </div>
+            <!-- Progress Bar - Always Visible -->
+            <div class="progress-container" style="background:#f7f7f7;border:1px solid var(--b);border-radius:.6rem;padding:.8rem;margin-bottom:.5rem">
+              <div class="progress-status muted" style="font-size:.9rem;margin-bottom:.5rem">ממתין להתחלה...</div>
+              <div style="height:12px;background:#e5e7eb;border-radius:8px;overflow:hidden">
+                <div class="bar" style="height:12px;width:0%;background:#16a34a;transition:width 0.3s ease"></div>
               </div>
+              <div class="muted" style="font-size:.85rem;margin-top:.3rem"><span class="pct">0%</span> <span class="eta"></span></div>
+            </div>
+            
+            <!-- Details Section -->
+            <details style="background:#f7f7f7;border:1px solid var(--b);border-radius:.6rem;padding:.6rem;margin-bottom:.5rem">
+              <summary style="cursor:pointer;font-weight:600">📋 פרטים</summary>
+              <div class="details-text muted" style="margin-top:.5rem;white-space:pre-wrap;line-height:1.6">—</div>
+            </details>
+            
+            <!-- Debug Section -->
+            <details style="background:#f7f7f7;border:1px solid var(--b);border-radius:.6rem;padding:.6rem">
+              <summary style="cursor:pointer;font-weight:600">🔧 Debug (FFmpeg)</summary>
+              <div class="debug-text muted" style="margin-top:.5rem;font-family:monospace;font-size:.75rem;word-break:break-all;line-height:1.4">—</div>
             </details>
           </td>
         </tr>
@@ -154,8 +164,14 @@
           r.querySelector('.title').textContent = 'ממתין...';
           r.querySelector('.title').classList.add('muted');
           r.querySelector('.status').textContent = '⌛';
-          const det = r.nextElementSibling.querySelector('.details-text');
-          det.textContent = '—';
+          const detailsRow = r.nextElementSibling;
+          detailsRow.querySelector('.progress-status').textContent = 'ממתין להתחלה...';
+          detailsRow.querySelector('.details-text').textContent = '—';
+          detailsRow.querySelector('.debug-text').textContent = '—';
+          detailsRow.querySelector('.pct').textContent = '0%';
+          detailsRow.querySelector('.bar').style.width = '0%';
+          detailsRow.querySelector('.bar').style.background = '#16a34a';
+          detailsRow.querySelector('.eta').textContent = '';
         });
 
         // Use fetch with streaming response
@@ -194,43 +210,74 @@
                   rows[idx].querySelector('.title').textContent = data.title;
                   rows[idx].querySelector('.title').classList.remove('muted');
                   rows[idx].querySelector('.status').textContent = '🔄';
+                  const statusEl = rows[idx].nextElementSibling.querySelector('.progress-status');
+                  statusEl.textContent = '🔄 מתחיל להוריד...';
                 }
                 else if(data.type === 'progress'){
-                  // Update status with progress message
-                  rows[idx].querySelector('.status').textContent = '🔄';
-                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
-                  det.textContent = data.message || 'מעבד...';
-                }
-                else if(data.type === 'progress'){
+                  // Update progress in real-time
                   rows[idx].querySelector('.status').textContent = '⬇️';
-                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
-                  const pctEl = rows[idx].nextElementSibling.querySelector('.pct');
-                  const barEl = rows[idx].nextElementSibling.querySelector('.bar');
-                  const etaEl = rows[idx].nextElementSibling.querySelector('.eta');
+                  const detailsRow = rows[idx].nextElementSibling;
+                  const statusEl = detailsRow.querySelector('.progress-status');
+                  const pctEl = detailsRow.querySelector('.pct');
+                  const barEl = detailsRow.querySelector('.bar');
+                  const etaEl = detailsRow.querySelector('.eta');
+                  
+                  // Update progress bar and percentage
                   if(typeof data.percent === 'number'){
                     pctEl.textContent = data.percent.toFixed(1) + '%';
                     barEl.style.width = data.percent.toFixed(1) + '%';
                   }
+                  
+                  // Update ETA
                   if(typeof data.eta === 'number'){
-                    etaEl.textContent = 'ETA ' + Math.max(0, data.eta|0) + 's';
+                    etaEl.textContent = '⏱️ ETA ' + Math.max(0, data.eta|0) + 's';
                   }
-                  if(data.filename){ det.textContent = data.filename; }
+                  
+                  // Update status message (FFmpeg progress or general status)
+                  if(data.status === 'fallback'){
+                    statusEl.textContent = '🔄 ' + (data.filename || 'מנסה שיטת fallback...');
+                  }
+                  else if(data.status === 'selenium'){
+                    statusEl.textContent = '🔄 ' + (data.filename || 'מעבד עם Selenium...');
+                  }
+                  else if(data.filename){
+                    statusEl.textContent = '⬇️ ' + data.filename;
+                  }
                 }
                 else if(data.type === 'result'){
                   // Update with final result
                   rows[idx].querySelector('.title').textContent = data.title || '—';
                   rows[idx].querySelector('.status').textContent = data.emoji || '❌';
-                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
-                  let extra = '';
-                  if(data.ffmpeg){ extra += '\nFFmpeg:\n' + data.ffmpeg; }
-                  if(data.output){ extra += '\nקובץ יעד:\n' + data.output; }
-                  det.textContent = (data.details || '—') + extra;
-                  // Fill progress to 100% if ok
+                  
+                  const detailsRow = rows[idx].nextElementSibling;
+                  const statusEl = detailsRow.querySelector('.progress-status');
+                  const det = detailsRow.querySelector('.details-text');
+                  const debugEl = detailsRow.querySelector('.debug-text');
+                  const pctEl = detailsRow.querySelector('.pct');
+                  const barEl = detailsRow.querySelector('.bar');
+                  
+                  // Update details section with clean, formatted info
+                  det.textContent = data.details || '—';
+                  
+                  // Update debug section with FFmpeg command and technical info
+                  let debugInfo = '';
+                  if(data.ffmpeg_cmd){
+                    debugInfo += 'פקודת FFmpeg:\n' + data.ffmpeg_cmd + '\n\n';
+                  }
+                  if(data.output){
+                    debugInfo += 'קובץ יעד:\n' + data.output;
+                  }
+                  debugEl.textContent = debugInfo || 'אין מידע debug זמין';
+                  
+                  // Update progress status
                   if(data.status === 'ok'){
-                    const pctEl = rows[idx].nextElementSibling.querySelector('.pct');
-                    const barEl = rows[idx].nextElementSibling.querySelector('.bar');
+                    statusEl.textContent = '✅ הושלם בהצלחה!';
                     pctEl.textContent = '100%';
                     barEl.style.width = '100%';
+                    barEl.style.background = '#16a34a'; // Green
+                  } else {
+                    statusEl.textContent = '❌ נכשל';
+                    barEl.style.background = '#dc2626'; // Red
                   }
                 }
                 else if(data.type === 'done'){

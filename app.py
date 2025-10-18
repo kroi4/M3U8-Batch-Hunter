@@ -530,6 +530,81 @@ def build_ffmpeg_cmd(m3u8_url: str, out_mp4: str, referer: str, ua: str = UA) ->
     )
     return cmd
 
+def parse_ffmpeg_progress(line: str) -> dict:
+    """Parse FFmpeg progress line to extract frame, fps, time, bitrate, speed"""
+    result = {}
+    try:
+        # FFmpeg outputs like: frame=12345 fps=30 q=-1.0 size=1234kB time=00:12:34.56 bitrate=1234.5kbits/s speed=1.5x
+        if 'frame=' in line:
+            match = re.search(r'frame=\s*(\d+)', line)
+            if match:
+                result['frame'] = int(match.group(1))
+        
+        if 'fps=' in line:
+            match = re.search(r'fps=\s*([\d.]+)', line)
+            if match:
+                result['fps'] = float(match.group(1))
+        
+        if 'time=' in line:
+            match = re.search(r'time=\s*([\d:\.]+)', line)
+            if match:
+                result['time'] = match.group(1)
+        
+        if 'bitrate=' in line:
+            match = re.search(r'bitrate=\s*([\d.]+)\s*kbits/s', line)
+            if match:
+                result['bitrate'] = f"{match.group(1)} kbps"
+        
+        if 'speed=' in line:
+            match = re.search(r'speed=\s*([\d.]+)x', line)
+            if match:
+                result['speed'] = f"{match.group(1)}x"
+        
+        if 'size=' in line:
+            match = re.search(r'size=\s*(\d+)kB', line)
+            if match:
+                result['size'] = f"{match.group(1)} KB"
+    except Exception:
+        pass
+    return result
+
+def run_ffmpeg_with_progress(cmd: str, progress_callback=None) -> int:
+    """
+    Run FFmpeg command and capture real-time progress.
+    Calls progress_callback(dict) with frame, fps, time, bitrate, speed info.
+    Returns the exit code.
+    """
+    import subprocess
+    
+    try:
+        # Run FFmpeg with pipes to capture stderr (where stats are printed)
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        # Read output line by line
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                # Parse progress info
+                progress_info = parse_ffmpeg_progress(line)
+                if progress_info and progress_callback:
+                    progress_callback(progress_info)
+        
+        # Wait for process to complete
+        process.wait()
+        return process.returncode
+        
+    except Exception as e:
+        print(f"FFmpeg error: {e}")
+        return 1
+
 def ensure_unique_path(path: str) -> str:
     base, ext = os.path.splitext(path)
     n = 1
@@ -733,23 +808,52 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
     retcode = None
     if run_now and has_ffmpeg:
         log_progress("🎬 מריץ FFmpeg להורדה...")
+        
+        # Create a callback that formats FFmpeg progress for the UI
+        def ffmpeg_progress_cb(info):
+            """Format FFmpeg progress info and send to UI"""
+            msg_parts = []
+            if 'time' in info:
+                msg_parts.append(f"⏱️ {info['time']}")
+            if 'speed' in info:
+                msg_parts.append(f"⚡ {info['speed']}")
+            if 'fps' in info:
+                msg_parts.append(f"🎞️ {info['fps']} fps")
+            if 'bitrate' in info:
+                msg_parts.append(f"📊 {info['bitrate']}")
+            
+            if msg_parts:
+                status_msg = " | ".join(msg_parts)
+                log_progress(f"⬇️ {status_msg}")
+        
         try:
-            retcode = subprocess.call(ff_cmd, shell=True)
+            retcode = run_ffmpeg_with_progress(ff_cmd, progress_callback=ffmpeg_progress_cb)
             ran = True
             log_progress(f"✅ FFmpeg הסתיים עם קוד {retcode}")
         except Exception as e:
             log_progress(f"❌ FFmpeg נכשל: {e}")
-            return {"url": page_url, "title": title_http or "(ללא כותרת)", "status": "error", "emoji": "❌", "details": f"FFmpeg error: {e}", "ffmpeg": ff_cmd}
+            return {
+                "url": page_url,
+                "title": title_http or "(ללא כותרת)",
+                "status": "error",
+                "emoji": "❌",
+                "details": f"❌ שגיאת FFmpeg: {str(e)}",
+                "ffmpeg_cmd": ff_cmd,
+                "output": out_path
+            }
 
     if run_now and has_ffmpeg and ran and retcode == 0 and os.path.exists(out_path):
+        # Calculate file size
+        file_size_mb = os.path.getsize(out_path) / (1024 * 1024)
         return {
             "url": page_url,
             "title": title_http or "(ללא כותרת)",
             "status": "ok",
             "emoji": "✅",
-            "details": f"נקלט ונשמר: {out_path}",
-            "ffmpeg": ff_cmd,
-            "output": out_path
+            "details": f"✅ הורדה הושלמה בהצלחה!\n📁 {out_path}\n📦 גודל: {file_size_mb:.1f} MB",
+            "ffmpeg_cmd": ff_cmd,
+            "output": out_path,
+            "file_size_mb": f"{file_size_mb:.1f}"
         }
     else:
         # Either FFmpeg missing or disabled or failed - create .cmd for manual run
@@ -761,14 +865,21 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
             pass
         status = "ok" if (not run_now or not has_ffmpeg) else "error"
         emoji = "✅" if status == "ok" else "❌"
-        details = "נוצר קובץ CMD להרצה ידנית: " + bat_path if status == "ok" else f"FFmpeg החזיר קוד {retcode}"
+        
+        if not has_ffmpeg:
+            details = f"⚠️ FFmpeg לא זמין במערכת\n📄 נוצר קובץ CMD: {bat_path}"
+        elif not run_now:
+            details = f"📄 נוצר קובץ CMD להרצה ידנית: {bat_path}"
+        else:
+            details = f"❌ FFmpeg נכשל עם קוד {retcode}\n📄 ניתן להריץ ידנית: {bat_path}"
+            
         return {
             "url": page_url,
             "title": title_http or "(ללא כותרת)",
             "status": status,
             "emoji": emoji,
             "details": details,
-            "ffmpeg": ff_cmd,
+            "ffmpeg_cmd": ff_cmd,
             "output": out_path
         }
 
