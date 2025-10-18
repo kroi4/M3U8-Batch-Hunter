@@ -999,4 +999,5 @@ def run_batch():
     )
 
 if __name__ == "__main__":
-    app.run(debug=True, threaded=True)
+    # Disable debug mode to prevent socket issues with multiple Selenium instances
+    app.run(debug=False, threaded=True, host='127.0.0.1', port=5000)
