@@ -419,7 +419,8 @@ def poll_m3u8_optimized(driver, max_seconds=30):
             ct = (req.response.headers or {}).get("Content-Type", "").lower()
             if (".m3u8" in url.lower()) or ("mpegurl" in ct):
                 found.add(url)
-                if "cdnapisec.kaltura.com" in url and "playmanifest" in url.lower():
+                # Check for master manifest from any Kaltura CDN
+                if "kaltura.com" in url and "playmanifest" in url.lower():
                     master_request = req
                     
     finally:
@@ -430,7 +431,8 @@ def poll_m3u8_optimized(driver, max_seconds=30):
     
     master_manifest_url = None
     for u in found:
-        if "cdnapisec.kaltura.com" in u and "playmanifest" in u.lower():
+        # Look for master manifest from any Kaltura CDN
+        if "kaltura.com" in u and "playmanifest" in u.lower():
             master_manifest_url = u
             break
     
@@ -465,8 +467,8 @@ def poll_m3u8(driver, max_seconds=90, interval=0.3, grace_after_first=2, min_lin
                 ct  = (req.response.headers or {}).get("Content-Type", "").lower()
                 if (".m3u8" in url.lower()) or ("mpegurl" in ct):
                     found.add(url)
-                    # Check if this is the master manifest
-                    if "cdnapisec.kaltura.com" in url and "playmanifest" in url.lower():
+                    # Check if this is the master manifest (any Kaltura CDN)
+                    if "kaltura.com" in url and "playmanifest" in url.lower():
                         master_request = req
                         if master_found_time is None:
                             master_found_time = time.time()
@@ -474,7 +476,7 @@ def poll_m3u8(driver, max_seconds=90, interval=0.3, grace_after_first=2, min_lin
         except Exception:
             pass
 
-        has_master = any(("cdnapisec.kaltura.com" in u and "playmanifest" in u.lower()) for u in found)
+        has_master = any(("kaltura.com" in u and "playmanifest" in u.lower()) for u in found)
         
         # If we found master manifest, wait only grace_after_first seconds and stop
         if has_master and master_found_time and (time.time() - master_found_time >= grace_after_first):
@@ -497,7 +499,8 @@ def poll_m3u8(driver, max_seconds=90, interval=0.3, grace_after_first=2, min_lin
 
     master_manifest_url = None
     for u in found:
-        if "cdnapisec.kaltura.com" in u and "playmanifest" in u.lower():
+        # Look for master manifest from any Kaltura CDN
+        if "kaltura.com" in u and "playmanifest" in u.lower():
             master_manifest_url = u
             break
 
@@ -724,16 +727,31 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
                 print(f"Warning: Failed to quit driver: {quit_error}")
 
     log_progress("🔍 מנתח וריאנטים...")
+    
+    # Debug: print all found m3u8s
+    log_progress(f"🔎 נמצאו {len(found_m3u8)} קישורי m3u8:")
+    for u in found_m3u8:
+        log_progress(f"  → {u[:100]}...")  # Print first 100 chars
+    
+    # Try to find master manifest
     master = None
     for u in found_m3u8:
-        if "cdnapisec.kaltura.com" in u and "playmanifest" in u.lower():
+        # Look for both cdnapisec and cfvod (both are Kaltura CDNs)
+        if ("cdnapisec.kaltura.com" in u or "cfvod.kaltura.com" in u) and "playmanifest" in u.lower():
             master = u
+            log_progress(f"✅ נמצא Master Manifest")
             break
 
+    # Try to extract variants from master
     variants = list_variants_from_master(master, referer=referer) if master else []
+    
+    # If no variants from master, try to find variant playlists directly
     if not variants:
+        log_progress("🔍 לא נמצאו variants מ-master, מנסה m3u8s ישירים...")
         for u in sorted(found_m3u8):
-            if "serveflavor" in u.lower() and u.lower().endswith(".m3u8"):
+            # Try all m3u8 files from Kaltura CDN
+            if u.lower().endswith(".m3u8") and ("kaltura.com" in u.lower()):
+                log_progress(f"  → מנסה: {u[:80]}...")
                 variants.append({"playlist": u, "bandwidth": 0, "resolution": None, "codecs": None})
 
     log_progress(f"📊 מנתח {len(variants)} וריאנטי איכות...")
@@ -743,14 +761,9 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
         try:
             a = analyze_variant(v["playlist"], referer=referer)
         except Exception as e:
-            log_progress(f"❌ שגיאה בניתוח וריאנט: {e}")
-            return {
-                "url": page_url,
-                "title": title_http or "(ללא כותרת)",
-                "status": "error",
-                "emoji": "❌",
-                "details": f"Failed analyzing variant: {e}",
-            }
+            log_progress(f"⚠️ שגיאה בניתוח וריאנט {v['playlist'][:80]}: {e}")
+            # Skip this variant and try the next one
+            continue
         declared_mbps = (v["bandwidth"] / 1e6) if v.get("bandwidth") else None
         est_mbps = declared_mbps or estimate_bitrate_mbps(a["segments"], referer=referer, sample_n=3)
         resolution = v.get("resolution") or guess_resolution_from_bitrate(est_mbps) or "N/A"
@@ -779,8 +792,20 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
     rows.sort(key=lambda r: r["sort_mbps"], reverse=True)
 
     if not rows:
-        log_progress("❌ לא נמצאו וריאנטים")
-        return {"url": page_url, "title": title_http or "(ללא כותרת)", "status": "error", "emoji": "❌", "details": "לא נמצאו וריאנטים להמרה."}
+        log_progress("❌ לא נמצאו וריאנטים תקינים")
+        error_details = f"❌ לא נמצאו וריאנטים תקינים להמרה\n\n"
+        error_details += f"📊 נמצאו {len(found_m3u8)} קישורי m3u8 אבל לא ניתן לנתח אותם\n"
+        if found_m3u8:
+            error_details += "\nקישורים שנמצאו:\n"
+            for u in list(found_m3u8)[:3]:  # Show first 3
+                error_details += f"  • {u[:100]}...\n"
+        return {
+            "url": page_url,
+            "title": title_http or "(ללא כותרת)",
+            "status": "error",
+            "emoji": "❌",
+            "details": error_details
+        }
 
     top = rows[0]
     log_progress(f"🎯 בחר איכות מיטבית: {top.get('resolution', 'N/A')}")
