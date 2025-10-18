@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import os, time, re, requests, shutil, subprocess, unicodedata, html as html_mod
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -12,11 +14,96 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
+from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
 UA = "Mozilla/5.0"
 DEFAULT_REFERER = None
+
+# ---------------- Generic downloader (yt-dlp) ----------------
+def _format_progress_percent(d: dict) -> float | None:
+    total = d.get('total_bytes') or d.get('total_bytes_estimate') or None
+    downloaded = d.get('downloaded_bytes') or None
+    if total and downloaded:
+        try:
+            return max(0.0, min(100.0, (downloaded / float(total)) * 100.0))
+        except Exception:
+            return None
+    return None
+
+def download_with_ytdlp(page_url: str, out_dir: str, progress_cb=None) -> dict:
+    """
+    Generic extractor/downloader using yt-dlp.
+    Emits progress via progress_cb(dict) where dict contains keys: status, percent, speed, eta, filename
+    Returns: dict with fields: status, title, output, details
+    Raises: Exception if extraction/download fails
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f"[yt-dlp] מנסה להוריד: {page_url}")
+
+    def _hook(d):
+        try:
+            kind = d.get('status')
+            if kind in ("downloading", "finished"):
+                pct = _format_progress_percent(d)
+                if kind == "finished":
+                    pct = 100.0
+                msg = {
+                    "status": kind,
+                    "percent": pct,
+                    "speed": d.get('speed'),
+                    "eta": d.get('eta'),
+                    "filename": d.get('filename')
+                }
+                if progress_cb:
+                    progress_cb(msg)
+        except Exception:
+            pass
+
+    ydl_opts = {
+        'quiet': False,  # Changed to False for debugging
+        'verbose': True,  # Enable verbose logging
+        'noprogress': True,
+        'outtmpl': os.path.join(out_dir, '%(title)s.%(ext)s'),
+        'merge_output_format': 'mp4',
+        'concurrent_fragment_downloads': 4,
+        'retries': 3,
+        'http_headers': {
+            'User-Agent': UA,
+            'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8',
+            'Referer': page_url,
+        },
+        'progress_hooks': [_hook],
+        # Prefer best video+audio; fall back to best muxed
+        'format': 'bv*+ba/b',
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        print(f"[yt-dlp] מחלץ מידע...")
+        info = ydl.extract_info(page_url, download=True)
+        print(f"[yt-dlp] הורדה הושלמה: {info.get('title')}")
+        
+        # Compute output path
+        ext = info.get('ext') or 'mp4'
+        title = info.get('title') or 'video'
+        out_path = os.path.join(out_dir, f"{safe_windows_filename(title)}.{ext}")
+        # yt-dlp may write into slightly different filename; try to find actual file
+        if not os.path.exists(out_path):
+            # Try from ydl prepare_filename
+            try:
+                tentative = ydl.prepare_filename(info)
+                if os.path.exists(tentative):
+                    out_path = tentative
+            except Exception:
+                pass
+        return {
+            "status": "ok",
+            "title": title,
+            "output": out_path,
+            "details": f"✅ הורד באמצעות yt-dlp",
+        }
 
 # ---------------- Title helpers ----------------
 def _norm_text(s: str) -> str:
@@ -484,6 +571,8 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    # Use eager page load strategy - don't wait for all resources (images, etc)
+    options.page_load_strategy = 'eager'
     # Note: NOT using headless mode as it may interfere with video player detection
     
     # Add logging to help debug
@@ -499,10 +588,19 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
         
+        # Set page load timeout to 60 seconds (sometimes pages are slow)
+        driver.set_page_load_timeout(60)
+        
         log_progress("📄 טוען דף...")
-        driver.get(page_url)
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(1.5)
+        try:
+            driver.get(page_url)
+            # Wait for page to be at least interactive (don't need full complete with eager strategy)
+            WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"])
+            time.sleep(1.5)
+        except TimeoutException:
+            log_progress("⚠️ הדף לוקח זמן לטעון, ממשיך בכל זאת...")
+            # Continue anyway - the page might be loaded enough
+            time.sleep(2)
         
         log_progress("🍪 מקבל עוגיות...")
         # Accept cookies if present
@@ -681,91 +779,87 @@ def index():
 
 @app.route("/run-batch", methods=["POST"])
 def run_batch():
-    """SSE endpoint - streams results as they complete"""
+    """SSE endpoint - runs downloads in parallel with per-item progress (yt-dlp)."""
     from flask import Response, stream_with_context
     import json
-    
+
     data = request.get_json(force=True)
     out_dir = data.get("out_dir") or "."
     urls = [u.strip() for u in (data.get("urls") or []) if u.strip()]
-    run_now = bool(data.get("run_now"))
+    run_now = data.get("run_now", True)  # Default to True - always download!
+    concurrency = int(data.get("concurrency") or 2)
 
     if not urls:
         return jsonify({"ok": False, "error": "לא סופקו קישורים."}), 400
 
     def generate():
-        """Generator that yields SSE formatted results"""
-        import traceback
-        
-        for idx, u in enumerate(urls):
-            # Small delay between URLs to allow cleanup
-            if idx > 0:
-                time.sleep(2)
+        q = queue.Queue()
+
+        def make_progress_cb(idx):
+            def _cb(msg: dict):
+                q.put({"index": idx, "type": "progress", **msg})
+            return _cb
+
+        def worker(idx, url):
+            # title via HTTP for fast UI fill
+            title = extract_title_via_http(url) or "(ללא כותרת)"
+            q.put({"index": idx, "type": "title", "title": title, "url": url})
             
-            # Send title first (from HTTP request)
+            # Try yt-dlp first (fast, generic)
             try:
-                title = extract_title_via_http(u)
-                yield f"data: {json.dumps({'index': idx, 'type': 'title', 'title': title or '(ללא כותרת)', 'url': u})}\n\n"
-            except Exception as e:
-                title = "(ללא כותרת)"
-                yield f"data: {json.dumps({'index': idx, 'type': 'title', 'title': title, 'url': u})}\n\n"
-            
-            # Send progress update - starting
-            yield f"data: {json.dumps({'index': idx, 'type': 'progress', 'message': '🔍 מתחיל עיבוד...'})}\n\n"
-            
-            # Process the URL with progress callback
-            # We'll use a shared list to collect progress messages
-            progress_messages = []
-            
-            class ProgressYielder:
-                """Helper class to yield progress updates in real-time"""
-                def __init__(self, idx):
-                    self.idx = idx
+                print(f"[Worker {idx}] מנסה yt-dlp עבור: {url}")
+                res = download_with_ytdlp(url, out_dir=out_dir, progress_cb=make_progress_cb(idx))
+                q.put({"index": idx, "type": "result", "emoji": "✅", "status": "ok", **res, "url": url})
+                print(f"[Worker {idx}] ✅ הצלחה עם yt-dlp")
+            except Exception as yt_error:
+                print(f"[Worker {idx}] ❌ yt-dlp נכשל: {yt_error}")
+                print(f"[Worker {idx}] 🔄 מנסה Selenium כ-fallback...")
+                q.put({"index": idx, "type": "progress", "status": "fallback", "percent": 0, "filename": "מנסה Selenium..."})
                 
-                def send(self, message):
-                    """Send a progress message"""
-                    progress_messages.append(f"data: {json.dumps({'index': self.idx, 'type': 'progress', 'message': message})}\n\n")
-            
-            try:
-                progress_yielder = ProgressYielder(idx)
-                
-                # Start a separate function to yield progress messages
-                import sys
-                sys.stdout.flush()  # Ensure output is flushed
-                
-                res = process_single_url(u, out_dir=out_dir, run_now=run_now, progress_callback=progress_yielder.send)
-                
-                # Yield any accumulated progress messages
-                for msg in progress_messages:
-                    yield msg
-                
-                res['index'] = idx
-                res['type'] = 'result'
-                yield f"data: {json.dumps(res)}\n\n"
-            except Exception as e:
-                # Detailed error logging
-                error_details = f"Exception: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-                res = {
-                    "index": idx,
-                    "type": "result",
-                    "url": u,
-                    "title": title,
-                    "status": "error",
-                    "emoji": "❌",
-                    "details": error_details
-                }
-                yield f"data: {json.dumps(res)}\n\n"
-        
-        # Send completion signal
+                # Fallback to Selenium (slower but works for Kaltura/13tv)
+                try:
+                    def selenium_progress(msg):
+                        q.put({"index": idx, "type": "progress", "status": "selenium", "percent": None, "filename": msg})
+                    
+                    res = process_single_url(url, out_dir=out_dir, run_now=run_now, progress_callback=selenium_progress)
+                    if res.get("status") == "ok":
+                        q.put({"index": idx, "type": "result", "emoji": "✅", **res, "url": url})
+                        print(f"[Worker {idx}] ✅ הצלחה עם Selenium")
+                    else:
+                        q.put({"index": idx, "type": "result", "emoji": "❌", **res, "url": url})
+                        print(f"[Worker {idx}] ❌ Selenium נכשל")
+                except Exception as selenium_error:
+                    print(f"[Worker {idx}] ❌ גם Selenium נכשל: {selenium_error}")
+                    error_msg = f"yt-dlp: {str(yt_error)}\n\nSelenium fallback: {str(selenium_error)}"
+                    q.put({"index": idx, "type": "result", "emoji": "❌", "status": "error", "details": error_msg, "url": url, "title": title})
+
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+            futures = []
+            for idx, u in enumerate(urls):
+                futures.append(ex.submit(worker, idx, u))
+
+            # While any worker is alive, drain queue and yield SSE
+            alive = True
+            while alive:
+                try:
+                    item = q.get(timeout=0.2)
+                    yield f"data: {json.dumps(item)}\n\n"
+                except Exception:
+                    pass
+                # Check if all futures done
+                alive = any(not f.done() for f in futures)
+
+        # flush remaining
+        while not q.empty():
+            item = q.get()
+            yield f"data: {json.dumps(item)}\n\n"
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return Response(
         stream_with_context(generate()),
         mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
     )
 
 if __name__ == "__main__":

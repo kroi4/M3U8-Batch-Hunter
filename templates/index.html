@@ -27,15 +27,21 @@
   </head>
   <body>
     <div class="card">
-      <h1>ממשק הורדה מרובת קישורים (Selenium‑Wire)</h1>
-      <p class="muted">בחר תיקיית יעד אחת, הוסף כמה לינקים שתרצה, ולחץ הרצה. לכל שורה: כותרת (דרך HTTP), סטטוס ✅/❌, ופירוט שגיאה/פרטים נפתחים.</p>
+      <h1>ממשק הורדה מרובת קישורים (חכם)</h1>
+      <p class="muted">מנסה תחילה yt-dlp (מהיר, כללי), ואם נכשל עובר אוטומטית ל-Selenium (Kaltura/13tv). תומך בהורדה מקבילית עם פס התקדמות!</p>
       <div class="row" style="margin:.5rem 0 1rem">
         <div style="flex:1;min-width:280px">
           <label for="outDir">תיקיית יעד</label>
-          <input id="outDir" type="text" placeholder="לדוגמה: D:\\Videos או /home/user/Videos">
+          <div style="display:flex;gap:.5rem">
+            <input id="outDir" type="text" placeholder="לדוגמה: D:\\Videos או /home/user/Videos" style="flex:1">
+            <button type="button" class="icon-btn" onclick="browseFolder()" title="עיון בתיקיות">📁</button>
+          </div>
           <div class="muted">הדבק/הקלד נתיב תיקייה מקומית. אם ריק, יישמר בתיקייה של הפרויקט.</div>
         </div>
-        <label class="flex"><input id="runNow" type="checkbox" checked> להריץ FFmpeg עכשיו</label>
+        <div class="flex" style="gap:.5rem">
+          <label>מקביליות</label>
+          <input id="concurrency" type="number" min="1" max="6" value="2" style="width:64px;padding:.3rem;border:1px solid var(--b);border-radius:.4rem">
+        </div>
       </div>
 
       <table id="urlsTable">
@@ -71,6 +77,12 @@
             <details open>
               <summary>פרטים</summary>
               <div class="details-text muted">—</div>
+              <div class="progress" style="margin-top:.4rem">
+                <div class="muted" style="font-size:.85rem"><span class="pct">0%</span> <span class="eta"></span></div>
+                <div style="height:8px;background:#eee;border-radius:6px;overflow:hidden">
+                  <div class="bar" style="height:8px;width:0%;background:#16a34a"></div>
+                </div>
+              </div>
             </details>
           </td>
         </tr>
@@ -78,6 +90,14 @@
     </div>
 
     <script>
+      // Load saved directory on page load
+      window.addEventListener('DOMContentLoaded', ()=>{
+        const saved = localStorage.getItem('lastOutputDir');
+        if(saved){
+          document.getElementById('outDir').value = saved;
+        }
+      });
+
       function addRow(val="") {
         const tpl = document.getElementById('rowTpl').content.cloneNode(true);
         const urlInput = tpl.querySelector('input.url');
@@ -92,15 +112,42 @@
         next.style.display = open ? 'none' : '';
         btn.textContent = open ? '▸' : '▾';
       }
+
+      async function browseFolder(){
+        try {
+          // Use File System Access API for directory picker
+          const dirHandle = await window.showDirectoryPicker();
+          // Get the full path (note: this is limited in browsers for security)
+          // We'll use the directory name as a fallback
+          const path = dirHandle.name;
+          
+          // Unfortunately, browsers don't expose full paths for security reasons
+          // So we'll prompt the user to paste the full path
+          const fullPath = prompt('הדפדפן לא יכול לקרוא את הנתיב המלא מסיבות אבטחה.\nהדבק את הנתיב המלא של התיקייה שבחרת:', '');
+          if(fullPath){
+            document.getElementById('outDir').value = fullPath.trim();
+            localStorage.setItem('lastOutputDir', fullPath.trim());
+          }
+        } catch(e) {
+          // Fallback: just let user type
+          alert('הדפדפן לא תומך בבחירת תיקיות.\nהקלד את הנתיב ידנית בשדה.');
+        }
+      }
+
       // start with one row
       addRow();
 
       async function runBatch(){
         const outDir = document.getElementById('outDir').value.trim();
-        const runNow = document.getElementById('runNow').checked;
+        const concurrency = Math.max(1, Math.min(6, parseInt(document.getElementById('concurrency').value || '2')));
         const rows = Array.from(document.querySelectorAll('#rows tr')).filter((_,i)=>i%2===0);
         const urls = rows.map(r=>r.querySelector('input.url').value.trim()).filter(Boolean);
         if(urls.length===0){ alert('הוסף לפחות כתובת אחת.'); return; }
+        
+        // Save the output directory for next time
+        if(outDir){
+          localStorage.setItem('lastOutputDir', outDir);
+        }
 
         // reset UI
         rows.forEach(r=>{
@@ -115,7 +162,7 @@
         const response = await fetch('/run-batch', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ out_dir: outDir, urls, run_now: runNow })
+          body: JSON.stringify({ out_dir: outDir, urls, concurrency })
         });
 
         if(!response.ok){
@@ -154,6 +201,21 @@
                   const det = rows[idx].nextElementSibling.querySelector('.details-text');
                   det.textContent = data.message || 'מעבד...';
                 }
+                else if(data.type === 'progress'){
+                  rows[idx].querySelector('.status').textContent = '⬇️';
+                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
+                  const pctEl = rows[idx].nextElementSibling.querySelector('.pct');
+                  const barEl = rows[idx].nextElementSibling.querySelector('.bar');
+                  const etaEl = rows[idx].nextElementSibling.querySelector('.eta');
+                  if(typeof data.percent === 'number'){
+                    pctEl.textContent = data.percent.toFixed(1) + '%';
+                    barEl.style.width = data.percent.toFixed(1) + '%';
+                  }
+                  if(typeof data.eta === 'number'){
+                    etaEl.textContent = 'ETA ' + Math.max(0, data.eta|0) + 's';
+                  }
+                  if(data.filename){ det.textContent = data.filename; }
+                }
                 else if(data.type === 'result'){
                   // Update with final result
                   rows[idx].querySelector('.title').textContent = data.title || '—';
@@ -163,6 +225,13 @@
                   if(data.ffmpeg){ extra += '\nFFmpeg:\n' + data.ffmpeg; }
                   if(data.output){ extra += '\nקובץ יעד:\n' + data.output; }
                   det.textContent = (data.details || '—') + extra;
+                  // Fill progress to 100% if ok
+                  if(data.status === 'ok'){
+                    const pctEl = rows[idx].nextElementSibling.querySelector('.pct');
+                    const barEl = rows[idx].nextElementSibling.querySelector('.bar');
+                    pctEl.textContent = '100%';
+                    barEl.style.width = '100%';
+                  }
                 }
                 else if(data.type === 'done'){
                   console.log('הושלם!');
