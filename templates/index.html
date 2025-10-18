@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Batch HLS Downloader UI</title>
+    <style>
+      :root{--b:#e5e7eb;--bg:#f9fafb;--muted:#6b7280;}
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;background:var(--bg);}
+      .card{max-width:1000px;margin:auto;border:1px solid var(--b);border-radius:16px;padding:1.25rem;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.06);}
+      .row{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;}
+      label{font-weight:600;}
+      input[type="text"]{padding:.6rem;border:1px solid var(--b);border-radius:.6rem;width:100%;}
+      .muted{color:var(--muted);font-size:.95rem}
+      button{padding:.6rem 1rem;border:0;border-radius:.7rem;background:#111;color:#fff;cursor:pointer}
+      button:hover{opacity:.9}
+      table{width:100%;border-collapse:collapse;margin-top:1rem}
+      th,td{border-bottom:1px solid var(--b);padding:.6rem;text-align:right}
+      tr:hover{background:#fafafa}
+      .icon-btn{background:#f3f4f6;border:1px solid var(--b);color:#111}
+      details{background:#f7f7f7;border:1px solid var(--b);border-radius:.6rem;padding:.6rem;margin-top:.4rem}
+      .status{font-size:1.2rem}
+      .flex{display:flex;gap:.5rem;align-items:center}
+      .chip{display:inline-block;padding:.15rem .45rem;border:1px solid var(--b);border-radius:.6rem;font-size:.8rem;color:#374151}
+      .footer{margin-top:1rem;display:flex;gap:.6rem;justify-content:space-between;align-items:center;flex-wrap:wrap}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>ממשק הורדה מרובת קישורים (Selenium‑Wire)</h1>
+      <p class="muted">בחר תיקיית יעד אחת, הוסף כמה לינקים שתרצה, ולחץ הרצה. לכל שורה: כותרת (דרך HTTP), סטטוס ✅/❌, ופירוט שגיאה/פרטים נפתחים.</p>
+      <div class="row" style="margin:.5rem 0 1rem">
+        <div style="flex:1;min-width:280px">
+          <label for="outDir">תיקיית יעד</label>
+          <input id="outDir" type="text" placeholder="לדוגמה: D:\\Videos או /home/user/Videos">
+          <div class="muted">הדבק/הקלד נתיב תיקייה מקומית. אם ריק, יישמר בתיקייה של הפרויקט.</div>
+        </div>
+        <label class="flex"><input id="runNow" type="checkbox" checked> להריץ FFmpeg עכשיו</label>
+      </div>
+
+      <table id="urlsTable">
+        <thead>
+          <tr>
+            <th style="width:48px"></th>
+            <th>כתובת אתר</th>
+            <th>כותרת</th>
+            <th style="width:80px">סטטוס</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+        </tbody>
+      </table>
+
+      <div class="footer">
+        <div class="flex">
+          <button class="icon-btn" onclick="addRow()">+ הוסף כתובת</button>
+          <span class="muted">טיפ: אפשר להדביק כמה URLs בשורות שונות.</span>
+        </div>
+        <button onclick="runBatch()">הרצה</button>
+      </div>
+
+      <template id="rowTpl">
+        <tr>
+          <td><button class="icon-btn" onclick="toggleDetails(this)">▸</button></td>
+          <td><input type="text" class="url" style="width:100%" placeholder="https://..."></td>
+          <td class="title muted">—</td>
+          <td class="status">⌛</td>
+        </tr>
+        <tr class="details-row" style="display:none">
+          <td colspan="4">
+            <details open>
+              <summary>פרטים</summary>
+              <div class="details-text muted">—</div>
+            </details>
+          </td>
+        </tr>
+      </template>
+    </div>
+
+    <script>
+      function addRow(val="") {
+        const tpl = document.getElementById('rowTpl').content.cloneNode(true);
+        const urlInput = tpl.querySelector('input.url');
+        urlInput.value = val;
+        document.getElementById('rows').appendChild(tpl);
+      }
+      function toggleDetails(btn){
+        const tr = btn.closest('tr');
+        const next = tr.nextElementSibling;
+        if(!next || !next.classList.contains('details-row')) return;
+        const open = next.style.display !== 'none';
+        next.style.display = open ? 'none' : '';
+        btn.textContent = open ? '▸' : '▾';
+      }
+      // start with one row
+      addRow();
+
+      async function runBatch(){
+        const outDir = document.getElementById('outDir').value.trim();
+        const runNow = document.getElementById('runNow').checked;
+        const rows = Array.from(document.querySelectorAll('#rows tr')).filter((_,i)=>i%2===0);
+        const urls = rows.map(r=>r.querySelector('input.url').value.trim()).filter(Boolean);
+        if(urls.length===0){ alert('הוסף לפחות כתובת אחת.'); return; }
+
+        // reset UI
+        rows.forEach(r=>{
+          r.querySelector('.title').textContent = 'ממתין...';
+          r.querySelector('.title').classList.add('muted');
+          r.querySelector('.status').textContent = '⌛';
+          const det = r.nextElementSibling.querySelector('.details-text');
+          det.textContent = '—';
+        });
+
+        // Use fetch with streaming response
+        const response = await fetch('/run-batch', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ out_dir: outDir, urls, run_now: runNow })
+        });
+
+        if(!response.ok){
+          alert('שגיאה בשרת');
+          return;
+        }
+
+        // Read SSE stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while(true){
+          const {done, value} = await reader.read();
+          if(done) break;
+          
+          buffer += decoder.decode(value, {stream: true});
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // Keep incomplete line in buffer
+          
+          for(const line of lines){
+            if(line.startsWith('data: ')){
+              try{
+                const data = JSON.parse(line.slice(6));
+                const idx = data.index;
+                
+                if(data.type === 'title'){
+                  // Update title immediately
+                  rows[idx].querySelector('.title').textContent = data.title;
+                  rows[idx].querySelector('.title').classList.remove('muted');
+                  rows[idx].querySelector('.status').textContent = '🔄';
+                }
+                else if(data.type === 'progress'){
+                  // Update status with progress message
+                  rows[idx].querySelector('.status').textContent = '🔄';
+                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
+                  det.textContent = data.message || 'מעבד...';
+                }
+                else if(data.type === 'result'){
+                  // Update with final result
+                  rows[idx].querySelector('.title').textContent = data.title || '—';
+                  rows[idx].querySelector('.status').textContent = data.emoji || '❌';
+                  const det = rows[idx].nextElementSibling.querySelector('.details-text');
+                  let extra = '';
+                  if(data.ffmpeg){ extra += '\nFFmpeg:\n' + data.ffmpeg; }
+                  if(data.output){ extra += '\nקובץ יעד:\n' + data.output; }
+                  det.textContent = (data.details || '—') + extra;
+                }
+                else if(data.type === 'done'){
+                  console.log('הושלם!');
+                }
+              }catch(e){
+                console.error('Parse error:', e);
+              }
+            }
+          }
+        }
+      }
+    </script>
+  </body>
+</html>
