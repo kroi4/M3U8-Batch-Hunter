@@ -16,6 +16,36 @@ from selenium.common.exceptions import StaleElementReferenceException, TimeoutEx
 from webdriver_manager.chrome import ChromeDriverManager
 from yt_dlp import YoutubeDL
 
+# Import new m3u8 capture modules
+try:
+    from m3u8_capture_playwright import (
+        capture_m3u8_via_playwright,
+        PlaywrightBrowserManager,
+        PLAYWRIGHT_AVAILABLE
+    )
+    PLAYWRIGHT_ENABLED = PLAYWRIGHT_AVAILABLE
+except ImportError:
+    PLAYWRIGHT_ENABLED = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Playwright not available. Install with: pip install playwright && playwright install chromium")
+
+try:
+    from m3u8_capture_selenium_cdp import (
+        capture_m3u8_via_selenium_cdp,
+        SeleniumCDPBrowserManager
+    )
+    SELENIUM_CDP_ENABLED = True
+except ImportError:
+    SELENIUM_CDP_ENABLED = False
+
+from m3u8_sniffer_utils import filter_and_prioritize_m3u8s, select_best_variant
+
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
 app = Flask(__name__)
 
 UA = "Mozilla/5.0"
@@ -154,6 +184,89 @@ def safe_windows_filename(name: str, max_len: int = 150) -> str:
         name = f"_{name}"
     name = name.rstrip(" .")
     return (name[:max_len].rstrip()) or "video"
+
+# ---------------- New M3U8 Capture (CDP-based) ----------------
+def try_capture_m3u8_via_cdp(page_url: str, timeout: int = 20) -> Tuple[set, Optional[str], dict]:
+    """
+    Try to capture m3u8 URLs using new CDP-based methods (Playwright or Selenium CDP).
+    
+    This is much lighter and faster than selenium-wire.
+    
+    Args:
+        page_url: URL to capture from
+        timeout: Timeout in seconds
+        
+    Returns:
+        Tuple of (found_m3u8_urls_set, master_manifest_url, empty_dict_for_headers)
+        Returns (set(), None, {}) if capture fails or no URLs found
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Try Playwright first (most efficient)
+    if PLAYWRIGHT_ENABLED:
+        logger.info("🎯 Attempting m3u8 capture via Playwright (CDP)...")
+        try:
+            m3u8_infos = capture_m3u8_via_playwright(
+                url=page_url,
+                browser_manager=None,  # Fresh browser for now
+                timeout=timeout,
+                wait_after_load=3.0
+            )
+            
+            if m3u8_infos:
+                logger.info(f"✅ Playwright captured {len(m3u8_infos)} m3u8 URLs")
+                
+                # Convert to set of URLs
+                found_urls = {info.url for info in m3u8_infos}
+                
+                # Find master manifest
+                master_url = None
+                for info in m3u8_infos:
+                    if info.is_master:
+                        master_url = info.url
+                        logger.info(f"🎯 Master manifest found: {master_url[:80]}...")
+                        break
+                
+                return found_urls, master_url, {}
+            else:
+                logger.warning("⚠️ Playwright found no m3u8 URLs")
+        except Exception as e:
+            logger.warning(f"⚠️ Playwright capture failed: {e}")
+    
+    # Try Selenium CDP as fallback
+    if SELENIUM_CDP_ENABLED:
+        logger.info("🎯 Attempting m3u8 capture via Selenium CDP...")
+        try:
+            m3u8_infos = capture_m3u8_via_selenium_cdp(
+                url=page_url,
+                driver_manager=None,  # Fresh driver for now
+                timeout=timeout,
+                wait_after_load=3.0
+            )
+            
+            if m3u8_infos:
+                logger.info(f"✅ Selenium CDP captured {len(m3u8_infos)} m3u8 URLs")
+                
+                # Convert to set of URLs
+                found_urls = {info.url for info in m3u8_infos}
+                
+                # Find master manifest
+                master_url = None
+                for info in m3u8_infos:
+                    if info.is_master:
+                        master_url = info.url
+                        logger.info(f"🎯 Master manifest found: {master_url[:80]}...")
+                        break
+                
+                return found_urls, master_url, {}
+            else:
+                logger.warning("⚠️ Selenium CDP found no m3u8 URLs")
+        except Exception as e:
+            logger.warning(f"⚠️ Selenium CDP capture failed: {e}")
+    
+    # If both methods unavailable or failed
+    logger.info("ℹ️ CDP capture not available or failed, will use selenium-wire fallback")
+    return set(), None, {}
 
 # ---------------- HLS helpers ----------------
 def parse_attribute_list(s: str):
@@ -639,92 +752,106 @@ def process_single_url(page_url: str, out_dir: str, run_now: bool = True, progre
     title_http = extract_title_via_http(page_url)
     title_safe = safe_windows_filename(title_http) if title_http else None
 
-    # Create fresh Chrome options and driver for each URL
-    log_progress("🌐 יוצר דפדפן...")
-    options = webdriver.ChromeOptions()
-    options.add_argument("--mute-audio")
-    options.add_argument("--autoplay-policy=no-user-gesture-required")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--window-size=1366,900")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    # Use eager page load strategy - don't wait for all resources (images, etc)
-    options.page_load_strategy = 'eager'
-    # Note: NOT using headless mode as it may interfere with video player detection
-    
-    # Add logging to help debug
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])
-
-    driver = None
     found_m3u8 = set()
     master_manifest_url = None
     referer = page_url
-
+    
+    # ===== NEW: Try CDP-based capture first (Playwright or Selenium CDP) =====
+    log_progress("🎯 מנסה לכידה באמצעות CDP (מהיר וקל)...")
     try:
-        # Create driver with fresh service each time
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        found_m3u8, master_manifest_url, _ = try_capture_m3u8_via_cdp(page_url, timeout=20)
         
-        # Set page load timeout to 60 seconds (sometimes pages are slow)
-        driver.set_page_load_timeout(60)
-        
-        log_progress("📄 טוען דף...")
-        try:
-            driver.get(page_url)
-            # Wait for page to be at least interactive (don't need full complete with eager strategy)
-            WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"])
-            time.sleep(1.5)
-        except TimeoutException:
-            log_progress("⚠️ הדף לוקח זמן לטעון, ממשיך בכל זאת...")
-            # Continue anyway - the page might be loaded enough
-            time.sleep(2)
-        
-        log_progress("🍪 מקבל עוגיות...")
-        # Accept cookies if present
-        for sel in ['#onetrust-accept-btn-handler', 'button[aria-label*="מסכים"]', 'button[aria-label*="מאשר"]']:
-            try:
-                els = driver.find_elements(By.CSS_SELECTOR, sel)
-                if els:
-                    try_click_el(driver, els[0])
-                    break
-            except Exception:
-                pass
-
-        log_progress("🎬 מחפש וידאו ומנסה להפעיל...")
-        # Use optimized version with wait_for_request (MUCH faster!)
-        found_m3u8, master_manifest_url, captured_headers, cookie_str = poll_m3u8_optimized(
-            driver,
-            max_seconds=25  # Should be found within seconds, not minutes!
-        )
-        
-        log_progress(f"✅ נמצאו {len(found_m3u8)} קישורי m3u8")
-        
+        if found_m3u8:
+            log_progress(f"✅ CDP לכד {len(found_m3u8)} קישורי m3u8 בהצלחה!")
+        else:
+            log_progress("⚠️ CDP לא מצא m3u8, עובר ל-selenium-wire fallback...")
     except Exception as e:
-        error_msg = f"Selenium/Load error: {str(e)}"
-        return {
-            "url": page_url,
-            "title": title_http or "(ללא כותרת)",
-            "status": "error",
-            "emoji": "❌",
-            "details": error_msg,
-        }
-    finally:
-        # Always close driver in finally block to ensure cleanup
-        if driver:
+        log_progress(f"⚠️ CDP נכשל: {e}, עובר ל-selenium-wire fallback...")
+    
+    # ===== Fallback to selenium-wire if CDP didn't find anything =====
+    if not found_m3u8:
+        log_progress("🌐 יוצר דפדפן (selenium-wire fallback)...")
+        options = webdriver.ChromeOptions()
+        options.add_argument("--mute-audio")
+        options.add_argument("--autoplay-policy=no-user-gesture-required")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--window-size=1366,900")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        # Use eager page load strategy - don't wait for all resources (images, etc)
+        options.page_load_strategy = 'eager'
+        # Note: NOT using headless mode as it may interfere with video player detection
+        
+        # Add logging to help debug
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+        driver = None
+
+        try:
+            # Create driver with fresh service each time
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            
+            # Set page load timeout to 60 seconds (sometimes pages are slow)
+            driver.set_page_load_timeout(60)
+            
+            log_progress("📄 טוען דף...")
             try:
-                # Clear requests to free memory
-                if hasattr(driver, 'requests'):
-                    try:
-                        del driver.requests
-                    except Exception:
-                        pass
-                # Quit the driver
-                driver.quit()
-                # Small delay to ensure cleanup
-                time.sleep(0.5)
-            except Exception as quit_error:
-                print(f"Warning: Failed to quit driver: {quit_error}")
+                driver.get(page_url)
+                # Wait for page to be at least interactive (don't need full complete with eager strategy)
+                WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"])
+                time.sleep(1.5)
+            except TimeoutException:
+                log_progress("⚠️ הדף לוקח זמן לטעון, ממשיך בכל זאת...")
+                # Continue anyway - the page might be loaded enough
+                time.sleep(2)
+            
+            log_progress("🍪 מקבל עוגיות...")
+            # Accept cookies if present
+            for sel in ['#onetrust-accept-btn-handler', 'button[aria-label*="מסכים"]', 'button[aria-label*="מאשר"]']:
+                try:
+                    els = driver.find_elements(By.CSS_SELECTOR, sel)
+                    if els:
+                        try_click_el(driver, els[0])
+                        break
+                except Exception:
+                    pass
+
+            log_progress("🎬 מחפש וידאו ומנסה להפעיל...")
+            # Use optimized version with wait_for_request (MUCH faster!)
+            found_m3u8, master_manifest_url, captured_headers, cookie_str = poll_m3u8_optimized(
+                driver,
+                max_seconds=25  # Should be found within seconds, not minutes!
+            )
+            
+            log_progress(f"✅ נמצאו {len(found_m3u8)} קישורי m3u8")
+            
+        except Exception as e:
+            error_msg = f"Selenium/Load error: {str(e)}"
+            return {
+                "url": page_url,
+                "title": title_http or "(ללא כותרת)",
+                "status": "error",
+                "emoji": "❌",
+                "details": error_msg,
+            }
+        finally:
+            # Always close driver in finally block to ensure cleanup
+            if driver:
+                try:
+                    # Clear requests to free memory
+                    if hasattr(driver, 'requests'):
+                        try:
+                            del driver.requests
+                        except Exception:
+                            pass
+                    # Quit the driver
+                    driver.quit()
+                    # Small delay to ensure cleanup
+                    time.sleep(0.5)
+                except Exception as quit_error:
+                    print(f"Warning: Failed to quit driver: {quit_error}")
 
     log_progress("🔍 מנתח וריאנטים...")
     

@@ -6,3 +6,14 @@ requests==2.32.3
 blinker==1.7.0
 setuptools
 yt-dlp
+
+# New dependencies for efficient m3u8 capture
+# Install Playwright (recommended for best performance):
+#   pip install playwright
+#   playwright install chromium
+# 
+# Playwright is OPTIONAL but highly recommended for:
+# - Much lower memory usage (~100-200MB vs 500MB+ with selenium-wire)
+# - Faster capture (direct CDP access, no MITM proxy)
+# - Better reliability
+playwright>=1.40.0
